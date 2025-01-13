@@ -71,25 +71,85 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    assert_eq!(y.shape(), x.shape(), "shape of x, y should be the same");
+    assert!(
+        y.shape().len() == 2 && x.shape().len() == 2,
+        "y and x should be just a 2d matrix right now"
+    );
+    assert_eq!(w.shape().len(), 1, "shape of x should be 1 dim");
+    assert_eq!(
+        *y.shape().last().unwrap(),
+        w.size(),
+        "dim of features of x, y should be the same as the dim of w"
+    );
+    let batch_size = y.shape()[0];
+    let features = y.shape()[1];
+    for i in 0..batch_size {
+        let mut sum_sq = 0.0f32;
+        for j in 0..features {
+            let xij = x.data()[i * features + j];
+            sum_sq += xij * xij;
+        }
+        let rms = (sum_sq / features as f32).sqrt();
+        for j in 0..features {
+            let _y = unsafe { y.data_mut() };
+            _y[i * features + j] = x.data()[i * features + j] / (rms + epsilon) * w.data()[j];
+        }
+    }
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
+    let len = y.size();
+    assert!(len == x.size());
 
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
-
-    todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+    let y_data = unsafe { y.data_mut() };
+    let x_data = x.data();
+    for i in 0..len {
+        let silu_x = silu(x_data[i]);
+        y_data[i] *= silu_x;
+    }
+}
+#[inline]
+fn silu(x: f32) -> f32 {
+    x * sigmoid(x)
 }
 
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    // a: 3 * 5, b: 2 * 5 => c: 3 * 2
+    assert!(
+        a.shape().len() == 2 && b.shape().len() == 2 && c.shape().len() == 2,
+        "a, b, c should be 2d matrix"
+    );
+    assert!(
+        a.shape()[1] == b.shape()[1]
+            && a.shape()[0] == c.shape()[0]
+            && b.shape()[0] == c.shape()[1],
+        "shape of a, b, c not correct"
+    );
+    let m = a.shape()[0];
+    let n = b.shape()[0];
+    let k = a.shape()[1];
+    let c_data = unsafe { c.data_mut() };
+    let a_data = a.data();
+    let b_data = b.data();
+    for i in 0..m {
+        for j in 0..n {
+            let mut ab_ij = 0.0f32;
+            for l in 0..k {
+                ab_ij += a_data[i * k + l] * b_data[j * k + l];
+            }
+            let c_ij = c_data[i * n + j];
+            c_data[i * n + j] = alpha * ab_ij + beta * c_ij;
+        }
+    }
 }
 
 // Dot product of two tensors (treated as vectors)

@@ -38,6 +38,44 @@ pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
 }
 
 // softmax(x) = exp(x - max) / sum(exp(x - max))
+// y = softmax(x)
+pub fn softmax(y: &mut Tensor<f32>) {
+    let ndim = y.shape().len();
+    assert!(ndim >= 2, "Tensor must have at least 2 dimensions.");
+
+    let seq_len = y.shape()[ndim - 2];
+    let total_seq_len = y.shape()[ndim - 1];
+    let batch = y.size() / (seq_len * total_seq_len);
+
+    let data = unsafe { y.data_mut() };
+
+    for b in 0..batch {
+        let base = b * seq_len * total_seq_len;
+        for i in 0..seq_len {
+            let offset = base + i * total_seq_len;
+
+            // Find the maximum value in the current slice for numerical stability
+            let max = data[offset..offset + total_seq_len]
+                .iter()
+                .fold(data[offset], |a, b| a.max(*b));
+
+            // Compute the exponentials and sum them
+            let mut sum = 0.0;
+            for j in 0..total_seq_len {
+                let e = (data[offset + j] - max).exp();
+                data[offset + j] = e;
+                sum += e;
+            }
+
+            // Normalize the exponentials to get softmax probabilities
+            for j in 0..total_seq_len {
+                data[offset + j] /= sum;
+            }
+        }
+    }
+}
+
+// softmax(x) = exp(x - max) / sum(exp(x - max))
 // y = softmax(mask(x))
 pub fn masked_softmax(y: &mut Tensor<f32>) {
     let ndim = y.shape().len();
@@ -72,18 +110,26 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
     assert_eq!(y.shape(), x.shape(), "shape of x, y should be the same");
-    assert!(
-        y.shape().len() == 2 && x.shape().len() == 2,
-        "y and x should be just a 2d matrix right now"
-    );
+    // assert!(
+    //     y.shape().len() == 2 && x.shape().len() == 2,
+    //     "y and x should be just a 2d matrix right now"
+    // );
     assert_eq!(w.shape().len(), 1, "shape of x should be 1 dim");
     assert_eq!(
         *y.shape().last().unwrap(),
         w.size(),
         "dim of features of x, y should be the same as the dim of w"
     );
-    let batch_size = y.shape()[0];
-    let features = y.shape()[1];
+    let batch_size = if y.shape().len() == 1 {
+        1
+    } else {
+        y.shape()[0]
+    };
+    let features = if y.shape().len() == 1 {
+        y.shape()[0]
+    } else {
+        y.shape()[1]
+    };
     for i in 0..batch_size {
         let mut sum_sq = 0.0f32;
         for j in 0..features {
@@ -92,8 +138,8 @@ pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: 
         }
         let rms = (sum_sq / features as f32).sqrt();
         for j in 0..features {
-            let _y = unsafe { y.data_mut() };
-            _y[i * features + j] = x.data()[i * features + j] / (rms + epsilon) * w.data()[j];
+            let y_data = unsafe { y.data_mut() };
+            y_data[i * features + j] = x.data()[i * features + j] / (rms + epsilon) * w.data()[j];
         }
     }
 }

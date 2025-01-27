@@ -3,7 +3,9 @@ use std::vec;
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
-use crate::operators::{self as OP, matmul_transb, rms_norm, swiglu};
+use crate::operators::{
+    self as OP, masked_softmax, matmul_transb, random_sample, rms_norm, swiglu,
+};
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
@@ -101,10 +103,37 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            todo!("self_attention(...)");
-            todo!("down_proj matmul and add residual");
+            self_attention(
+                &mut hidden_states,
+                &mut att_scores,
+                q,
+                &full_k,
+                &full_v,
+                self.n_kv_h,
+                n_groups,
+                seq_len,
+                total_seq_len,
+                self.dqkv,
+            );
+            matmul_transb(
+                &mut residual,
+                1.0,
+                &hidden_states,
+                &self.params.wo[layer],
+                1.0,
+            );
 
-            todo!("mlp(...)");
+            mlp(
+                &mut residual,
+                &mut hidden_states,
+                &mut gate_buf,
+                &mut up_buf,
+                &self.params.w_up[layer],
+                &self.params.w_down[layer],
+                &self.params.w_gate[layer],
+                &self.params.rms_ffn_w[layer],
+                self.eps,
+            );
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
@@ -113,12 +142,16 @@ impl Llama<f32> {
         let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
         let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
 
+        assert_eq!(hidden_states.shape()[0], 1);
+        assert_eq!(hidden_states.shape()[1], self.d);
+        hidden_states.reshape(&vec![self.d]);
         OP::rms_norm(
             &mut hidden_states,
             &residual,
             &self.params.rms_out_w,
             self.eps,
         );
+        hidden_states.reshape(&vec![1, self.d]);
 
         OP::matmul_transb(&mut logits, 0., &hidden_states, &self.params.lm_head, 1.0);
 
@@ -134,9 +167,18 @@ impl Llama<f32> {
         temperature: f32,
     ) -> Vec<u32> {
         let mut result = Vec::<u32>::new();
-
-        todo!("实现文本生成");
-
+        let mut kv_cache = self.new_cache();
+        let mut token_ids_input = token_ids.to_vec();
+        while result.len() < max_len {
+            let inputs = Tensor::new(token_ids_input.clone(), &vec![token_ids_input.len()]);
+            let logits = self.forward(&inputs, &mut kv_cache);
+            let index = random_sample(&logits, top_p, top_k, temperature);
+            if index == self.eos_token_id {
+                break;
+            }
+            token_ids_input = vec![index];
+            result.push(index);
+        }
         result
     }
 }
@@ -153,7 +195,64 @@ fn self_attention(
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    todo!("Implement self_attention");
+    let q_data = q.data();
+    let k_data = k.data();
+    let att_scores_data = unsafe { att_scores.data_mut() };
+    let v_data = v.data();
+
+    let q_shape = q.shape();
+    let n_q_h = q_shape[1];
+    // att = Q @ K.T
+    for kv_h in 0..n_kv_h {
+        let kv_h_off = kv_h * n_groups * seq_len * total_seq_len;
+        for sub_head in 0..n_groups {
+            let group_off = sub_head * seq_len * total_seq_len;
+            for q_seq in 0..seq_len {
+                let q_seq_off = q_seq * total_seq_len;
+                for k_seq in 0..total_seq_len {
+                    let attr_scores_off = kv_h_off + group_off + q_seq_off + k_seq;
+                    let q_vec_off = q_seq * n_q_h * dqkv + (kv_h * n_groups + sub_head) * dqkv;
+                    let k_vec_off = k_seq * n_kv_h * dqkv + kv_h * dqkv;
+                    let mut attr_q_k = 0.0;
+                    for dim in 0..dqkv {
+                        attr_q_k += q_data[q_vec_off + dim] * k_data[k_vec_off + dim];
+                    }
+                    att_scores_data[attr_scores_off] = attr_q_k;
+                }
+            }
+        }
+    }
+    // att /= sqrt(dim)
+    let dim_sqrt = dqkv.isqrt() as f32;
+    for att in att_scores_data {
+        *att /= dim_sqrt;
+    }
+    // softmax(att)
+    masked_softmax(att_scores);
+    // att_V = att @ V
+    let att_data = att_scores.data();
+    let att_v_data = unsafe { hidden_states.data_mut() };
+    for token in 0..seq_len {
+        let token_off = token * n_kv_h * n_groups * dqkv;
+        for kv_h in 0..n_kv_h {
+            let kv_h_off = kv_h * n_groups * dqkv;
+            for sub_head in 0..n_groups {
+                let group_off = sub_head * dqkv;
+                for dim in 0..dqkv {
+                    let att_v_per_head_off = token_off + kv_h_off + group_off + dim;
+                    let mut all_seq_attr_v = 0.0;
+                    let att_off = kv_h * n_groups * seq_len * total_seq_len
+                        + sub_head * seq_len * total_seq_len
+                        + token * total_seq_len;
+                    for seq in 0..total_seq_len {
+                        let v_off = seq * n_kv_h * dqkv + kv_h * dqkv + dim;
+                        all_seq_attr_v += att_data[att_off + seq] * v_data[v_off];
+                    }
+                    att_v_data[att_v_per_head_off] = all_seq_attr_v;
+                }
+            }
+        }
+    }
 }
 
 fn mlp(
@@ -170,8 +269,8 @@ fn mlp(
     rms_norm(hidden_states, residual, rms_w, eps);
     matmul_transb(gate, 0.0f32, hidden_states, w_gate, 1.0f32);
     matmul_transb(up, 0.0f32, hidden_states, w_up, 1.0f32);
-    swiglu(gate, up);
-    matmul_transb(residual, 1.0f32, gate, w_down, 1.0f32);
+    swiglu(up, gate);
+    matmul_transb(residual, 1.0f32, up, w_down, 1.0f32);
 }
 
 #[test]
